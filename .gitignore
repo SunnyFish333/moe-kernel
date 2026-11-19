@@ -8,3 +8,8 @@ dist/
 .triton/
 results/*
 !results/.gitkeep
+
+/test/
+/tests/
+/test_results/
+/.vscode/

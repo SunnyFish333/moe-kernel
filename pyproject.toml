@@ -11,7 +11,6 @@ requires-python = ">=3.10"
 dependencies = ["torch>=2.8"]
 
 [project.optional-dependencies]
-dev = ["pytest>=8"]
 vllm = ["vllm==0.20.0"]
 
 [project.entry-points."vllm.general_plugins"]
@@ -19,8 +18,4 @@ moe_kernel = "integrations.vllm.adapter:register"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["moe_kernel*", "integrations*"]
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-addopts = "-ra"
+include = ["moe_kernel*", "integrations*", "benchmarks*"]

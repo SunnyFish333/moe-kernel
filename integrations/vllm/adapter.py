@@ -11,7 +11,7 @@ import torch
 from moe_kernel import MoEConfig, MoEWorkspace, experts, moe
 
 
-_LOG = logging.getLogger(__name__)
+_LOG = logging.getLogger("vllm.moe_kernel")
 _MODES = ("native", "experts", "full")
 _EXPECTED_ARGS = ("self", "layer", "hidden_states", "router_logits", "shared_experts_input", "input_ids")
 
