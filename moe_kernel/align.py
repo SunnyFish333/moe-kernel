@@ -7,7 +7,7 @@ import triton
 import triton.language as tl
 
 from ._validation import check_tensor
-from .workspace import MoEWorkspace
+from .workspace import MoEWorkspace, max_route_blocks
 
 
 class AlignedRoutes(NamedTuple):
@@ -110,7 +110,7 @@ def align(topk_ids: torch.Tensor, *, num_experts: int, block_size: int,
             _count_kernel[route_grid](topk_ids, counts, num_routes, num_experts, route_tile)
         _prefix_kernel[(1,)](counts, offsets, p, num_experts, block_size, expert_tile)
         if num_routes:
-            _fill_experts_kernel[(num_blocks,)](
+            _fill_experts_kernel[(max_route_blocks(num_routes, num_experts, block_size),)](
                 offsets, expert_ids, p, num_experts, block_size, expert_tile,
             )
             _scatter_kernel[route_grid](

@@ -11,9 +11,17 @@ from .config import MoEConfig
 _EXPERT_BUFFERS = ("gate_up", "activation", "weighted_output", "topk_weights", "topk_ids")
 
 
+def max_route_blocks(num_routes: int, num_experts: int, block_size: int) -> int:
+    """任意路由分布下的行块数上界。"""
+    nonempty = min(num_experts, num_routes)
+    return nonempty + (num_routes - nonempty) // block_size
+
+
 @dataclass
 class MoEWorkspace:
     buffers: dict[str, torch.Tensor] = field(default_factory=dict)
+    _prefill_align: dict[int, 'MoEWorkspace'] = field(default_factory=dict, init=False, repr=False)
+    _wide_k: bool = field(default=False, init=False, repr=False)
     _align_spec: tuple[int, int, int, int] | None = field(default=None, init=False, repr=False)
 
     def prepare(self, *, max_tokens: int, config: MoEConfig, device: torch.device,
@@ -27,6 +35,17 @@ class MoEWorkspace:
         self.prepare_align(max_tokens=max_tokens, top_k=config.top_k,
                            num_experts=config.num_experts, block_size=block_m, device=device)
         device = self.buffers["counts"].device
+        # 仅在实测相同架构和矩阵尺寸上使用这组 tile。
+        self._wide_k = (h, n, config.num_experts, config.top_k, dtype) == (
+            2048, 512, 256, 8, torch.bfloat16,
+        ) and torch.cuda.get_device_capability(device) == (12, 0)
+        if self._wide_k and block_m == 16:
+            for minimum, bm in ((96, 64), (1024, 128)):
+                if max_tokens >= minimum:
+                    scratch = MoEWorkspace()
+                    scratch.prepare_align(max_tokens=max_tokens, top_k=config.top_k,
+                                          num_experts=config.num_experts, block_size=bm, device=device)
+                    self._prefill_align[bm] = scratch
         q = max_tokens * config.top_k
         self.buffers.update(
             gate_up=torch.empty((q, 2 * n), device=device, dtype=dtype),
@@ -46,9 +65,7 @@ class MoEWorkspace:
             raise ValueError("要求 max_tokens >= 0、block_size > 0 且 1 <= top_k <= num_experts")
 
         max_routes = max_tokens * top_k
-        # 每个非空专家至少用一条路由占一块；其余每凑满 BM 条才可能多占一块。
-        nonempty = min(num_experts, max_routes)
-        num_blocks = nonempty + (max_routes - nonempty) // block_size
+        num_blocks = max_route_blocks(max_routes, num_experts, block_size)
         capacity = num_blocks * block_size
         if max(num_experts, capacity) > torch.iinfo(torch.int32).max:
             raise ValueError("align 索引容量超出 INT32 范围")
@@ -60,6 +77,8 @@ class MoEWorkspace:
         for name in _EXPERT_BUFFERS:
             self.buffers.pop(name, None)
         self.buffers.update(buffers)
+        self._wide_k = False
+        self._prefill_align.clear()
         self._align_spec = (max_tokens, top_k, num_experts, block_size)
 
     def _check_experts(self, x: torch.Tensor, *, num_experts: int, top_k: int,

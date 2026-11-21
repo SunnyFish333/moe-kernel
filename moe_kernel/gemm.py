@@ -6,21 +6,27 @@ import triton.language as tl
 
 from ._validation import ACTIVATION_DTYPES, check_tensor
 from .align import AlignedRoutes
+from .workspace import max_route_blocks
 
 
 @triton.jit
 def _indirect_gemm_kernel(
     a, weights, sorted_ids, expert_ids, num_post_pad, route_weights, out,
-    num_routes, OUT_DIM: tl.constexpr, REDUCE_DIM: tl.constexpr,
+    num_routes, OUT_DIM: tl.constexpr, REDUCE_DIM: tl.constexpr, NUM_EXPERTS: tl.constexpr,
     ROW_DIVISOR: tl.constexpr, APPLY_WEIGHT: tl.constexpr,
-    BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+    BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, DIRECT: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     start = pid_m * BM
-    # grid 按容量发射，实际行数由 GPU 上的 P 决定。
-    if start < tl.load(num_post_pad):
+    # grid 使用当前路由数的上界；实际行数由 GPU 上的 P 决定。
+    if DIRECT or start < tl.load(num_post_pad):
         e = tl.load(expert_ids + pid_m).to(tl.int64)
-        q = tl.load(sorted_ids + start + tl.arange(0, BM)).to(tl.int64)
+        if DIRECT:
+            q = tl.where(tl.arange(0, BM) == 0, pid_m, num_routes).to(tl.int64)
+            valid_expert = (e >= 0) & (e < NUM_EXPERTS)
+        else:
+            q = tl.load(sorted_ids + start + tl.arange(0, BM)).to(tl.int64)
+            valid_expert = True
         valid_q = q < num_routes
         rows = q // ROW_DIVISOR
         cols = tl.program_id(1) * BN + tl.arange(0, BN)
@@ -36,7 +42,7 @@ def _indirect_gemm_kernel(
             )
             b_tile = tl.load(
                 expert_weights + cols[None, :].to(tl.int64) * REDUCE_DIM + kk[:, None],
-                (kk[:, None] < REDUCE_DIM) & (cols[None, :] < OUT_DIM), other=0,
+                valid_expert & (kk[:, None] < REDUCE_DIM) & (cols[None, :] < OUT_DIM), other=0,
             )
             acc = tl.dot(a_tile, b_tile, acc)
 
@@ -53,7 +59,8 @@ def _indirect_gemm_kernel(
 def indirect_gemm(a: torch.Tensor, weights: torch.Tensor, routes: AlignedRoutes,
                   *, input_row_divisor: int, num_routes: int, out: torch.Tensor,
                   topk_weights: torch.Tensor | None = None,
-                  block_m: int = 16, block_n: int = 64, block_k: int = 32) -> torch.Tensor:
+                  block_m: int = 16, block_n: int = 64, block_k: int = 32,
+                  num_warps: int = 4, num_stages: int = 2) -> torch.Tensor:
     """GEMM1 读 q//R 行；GEMM2 读 q 行并可加权。两者均按 q 写回。
 
     routes 必须来自同一批输入的 align()，out 必须独立于输入和路由缓冲区。
@@ -83,11 +90,25 @@ def indirect_gemm(a: torch.Tensor, weights: torch.Tensor, routes: AlignedRoutes,
     if not num_routes:
         return out
 
-    grid = (routes.expert_ids.numel(), triton.cdiv(out_dim, block_n))
+    max_blocks = max_route_blocks(num_routes, num_experts, block_m)
+    grid = (min(max_blocks, routes.expert_ids.numel()), triton.cdiv(out_dim, block_n))
     with torch.cuda.device(a.device):
         _indirect_gemm_kernel[grid](
             a, weights, *routes, topk_weights, out, num_routes,
-            out_dim, reduce_dim, input_row_divisor, topk_weights is not None,
-            block_m, block_n, block_k, num_warps=4, num_stages=2,
+            out_dim, reduce_dim, num_experts, input_row_divisor, topk_weights is not None,
+            block_m, block_n, block_k, False, num_warps=num_warps, num_stages=num_stages,
         )
     return out
+
+def direct_gemm(a, weights, topk_ids, *, input_row_divisor, out, topk_weights=None,
+                block_n=64, block_k=128, num_warps=4, num_stages=3):
+    """小批次直接用每条路由的 expert ID，不做分组。供已验证形状的 MoE 入口使用。"""
+    num_routes = topk_ids.numel()
+    num_experts, out_dim, reduce_dim = weights.shape
+    grid = (num_routes, triton.cdiv(out_dim, block_n))
+    with torch.cuda.device(a.device):
+        _indirect_gemm_kernel[grid](
+            a, weights, None, topk_ids, None, topk_weights, out, num_routes,
+            out_dim, reduce_dim, num_experts, input_row_divisor, topk_weights is not None,
+            16, block_n, block_k, True, num_warps=num_warps, num_stages=num_stages,
+        )

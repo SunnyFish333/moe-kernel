@@ -5,7 +5,8 @@ import torch
 from ._validation import ACTIVATION_DTYPES, check_tensor
 from .activation import silu_and_mul
 from .align import align
-from .gemm import indirect_gemm
+from .align_short import align_short
+from .gemm import direct_gemm, indirect_gemm
 from .reduce import sum_topk
 from .router import fused_topk
 from .workspace import MoEWorkspace
@@ -41,12 +42,34 @@ def _run_experts(x, w13, w2, topk_weights, topk_ids, workspace, block_m, out):
     gate_up = buffers["gate_up"][:q]
     activation = buffers["activation"][:q]
     weighted = buffers["weighted_output"][:q]
-    routes = align(topk_ids, num_experts=w2.shape[0], block_size=block_m, workspace=workspace)
-    indirect_gemm(x, w13, routes, input_row_divisor=r, num_routes=q, out=gate_up,
-                  block_m=block_m)
-    silu_and_mul(gate_up, out=activation)
-    indirect_gemm(activation, w2, routes, input_row_divisor=1, num_routes=q,
-                  out=weighted, topk_weights=topk_weights, block_m=block_m)
+    block_k, stages = (128, 3) if workspace._wide_k else (32, 2)
+    if m == 1 and r <= 8:
+        direct_gemm(x, w13, topk_ids, input_row_divisor=r, out=gate_up,
+                    block_k=block_k, num_stages=stages)
+        silu_and_mul(gate_up, out=activation)
+        direct_gemm(activation, w2, topk_ids, input_row_divisor=1, out=weighted,
+                    topk_weights=topk_weights, block_k=block_k, num_stages=stages)
+    else:
+        # Blackwell 目标形状按批次选 tile，激活和输出缓冲区依旧共享。
+        alignment = workspace
+        block_n, warps = 64, 4
+        if m >= 1024 and 128 in workspace._prefill_align:
+            block_m, block_n, block_k, warps, stages = 128, 256, 64, 8, 3
+            alignment = workspace._prefill_align[block_m]
+        elif m >= 96 and 64 in workspace._prefill_align:
+            block_m, block_n, block_k, stages = 64, 128, 64, 4
+            alignment = workspace._prefill_align[block_m]
+        if workspace._wide_k and block_m == 16 and m <= 8:
+            routes = align_short(topk_ids, num_experts=w2.shape[0], workspace=alignment)
+        else:
+            routes = align(topk_ids, num_experts=w2.shape[0], block_size=block_m, workspace=alignment)
+        indirect_gemm(x, w13, routes, input_row_divisor=r, num_routes=q, out=gate_up,
+                      block_m=block_m, block_n=block_n, block_k=block_k,
+                      num_warps=warps, num_stages=stages)
+        silu_and_mul(gate_up, out=activation)
+        indirect_gemm(activation, w2, routes, input_row_divisor=1, num_routes=q,
+                      out=weighted, topk_weights=topk_weights, block_m=block_m,
+                      block_n=block_n, block_k=block_k, num_warps=warps, num_stages=stages)
     return sum_topk(weighted.view(m, r, h), out=out)
 
 

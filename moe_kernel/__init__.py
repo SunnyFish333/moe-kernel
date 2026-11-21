@@ -1,4 +1,4 @@
-"""单卡 MoE 算子包；当前仅提供接口骨架。"""
+"""单卡 Triton MoE 前向算子。"""
 
 from .api import experts, moe
 from .config import MoEConfig
