@@ -1,35 +1,27 @@
-<h1 align="center">MoE Kernel</h1>
+# MoE Kernel
 
-<p align="center"><strong>面向 Qwen3.5 的单卡 Triton MoE 推理算子</strong></p>
+面向 Qwen3.5 的单卡 Triton MoE 推理算子。支持 BF16/FP16 专家前向，可从 logits 执行 Softmax Top-K，也可复用已有路由。项目提供 vLLM 插件，并针对小批次 decode 做了优化。
 
-<p align="center">
-  <a href="#快速开始">快速开始</a> ·
-  <a href="#性能">性能</a> ·
-  <a href="#vllm-集成">vLLM 集成</a> ·
-  <a href="#实现">实现</a> ·
-  <a href="benchmarks/README.md">评测指南</a>
-</p>
-
-MoE Kernel 提供独立的 Softmax Top-K 与专家前向，也可通过插件替换 vLLM 中 Qwen3.5 的路由专家分支。算子支持 BF16/FP16 专家计算，重点优化小批次 decode，并提供 PyTorch 对照、真实单层回放和整模型服务评测。
+[快速开始](#快速开始) · [性能](#性能) · [vLLM 集成](#vllm-集成) · [实现](#实现) · [评测指南](benchmarks/README.md)
 
 ## 性能
 
 在单张 **NVIDIA RTX PRO 6000 Blackwell** 上，使用 **Qwen3.5-35B-A3B BF16** 和 **vLLM 0.20.0**。
 
-**真实单层 decode 回放**使用相同的专家 ID、路由权重和模型层输入。CUDA Event 计时独立算子的 CUDA Graph 重放，单位为 µs。
+**真实单层 decode 回放** 使用相同的专家 ID、路由权重和模型层输入。CUDA Event 计时独立算子的 CUDA Graph 重放，单位为 µs。
 
-| 每批 token 数 | vLLM Triton | MoE Kernel | 专家计算耗时变化 |
-| ---: | ---: | ---: | ---: |
+| 批次 token | vLLM Triton | MoE Kernel | 耗时变化 |
+| :---: | :---: | :---: | :---: |
 | 1 | 22.99 | 15.03 | **−34.6%** |
 | 4 | 55.48 | 23.71 | **−57.3%** |
 | 8 | 99.01 | 25.13 | **−74.6%** |
 
 回放覆盖第 0、20、39 层的 13 个样本。1,740 个 token 的 Top-K 专家集合全部匹配原生实现，routed 输出最大绝对误差为 0.0078125。实测的三个 prefill 批次（130、520、1040 token）在专家计算上与原生接近。
 
-**整模型服务压测**使用 eager 模式、128 输入 token、16 输出 token、并发 8。共 3 轮、9 组、288 个计量请求，下表为相对同轮 `native` 的变化中位数。
+**整模型服务压测** 使用 eager 模式、128 输入 token、16 输出 token、并发 8。共 3 轮、9 组、288 个计量请求，下表为相对同轮 `native` 的变化中位数。
 
 | 模式 | 输出吞吐 | P95 首 token 延迟 |
-| --- | ---: | ---: |
+| :---: | :---: | :---: |
 | `experts` | +2.33% | +11.23% |
 | `full` | +0.70% | +5.01% |
 
@@ -80,7 +72,7 @@ with torch.inference_mode():
 在兼容的 vLLM 0.20.0 环境内安装本项目。插件适用于单卡、未量化的 Qwen3.5 MoE。三种模式保留原生 Router Linear、共享专家、输出合并与调度。
 
 | `MOE_KERNEL_MODE` | Softmax Top-K | 路由专家 |
-| --- | --- | --- |
+| :---: | :---: | :---: |
 | `native`（默认） | vLLM | vLLM |
 | `experts` | vLLM | MoE Kernel |
 | `full` | MoE Kernel | MoE Kernel |
@@ -98,9 +90,7 @@ MOE_KERNEL_MODE=experts MOE_KERNEL_MAX_TOKENS=2048 \
 
 ## 实现
 
-<p align="center">
-  <img src="qwen3.5-35b-a3b-moe-architecture.svg" alt="Qwen3.5-35B-A3B 文本解码器与 MoE，256 个路由专家中每 token 选择 8 个，同时经过 1 个共享专家" width="900">
-</p>
+![Qwen3.5-35B-A3B 文本解码器与 MoE，256 个路由专家中每 token 选择 8 个，同时经过 1 个共享专家](qwen3.5-35b-a3b-moe-architecture.svg)
 
 图依据 [Qwen 官方模型卡](https://huggingface.co/Qwen/Qwen3.5-35B-A3B)和[模型配置](https://huggingface.co/Qwen/Qwen3.5-35B-A3B/blob/main/config.json)绘制。
 
