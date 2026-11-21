@@ -1,21 +1,51 @@
-# MoE Kernel
+<h1 align="center">MoE Kernel</h1>
 
-用于单卡 NVIDIA GPU 推理的 Triton MoE 前向算子。支持从 router logits 完成专家路由与计算，也可直接使用已有路由结果。项目提供 vLLM 插件、PyTorch 数值对照和三层性能评测工具。
+<p align="center"><strong>面向 Qwen3.5 的单卡 Triton MoE 推理算子</strong></p>
 
-- [快速开始](#快速开始)
-- [实现](#实现)
-- [vLLM 集成](integrations/vllm/README.md)
-- [测试与评测](#测试与评测)
+<p align="center">
+  <a href="#快速开始">快速开始</a> ·
+  <a href="#性能">性能</a> ·
+  <a href="#vllm-集成">vLLM 集成</a> ·
+  <a href="#实现">实现</a> ·
+  <a href="benchmarks/README.md">评测指南</a>
+</p>
+
+MoE Kernel 提供独立的 Softmax Top-K 与专家前向，也可通过插件替换 vLLM 中 Qwen3.5 的路由专家分支。算子支持 BF16/FP16 专家计算，重点优化小批次 decode，并提供 PyTorch 对照、真实单层回放和整模型服务评测。
+
+## 性能
+
+在单张 **NVIDIA RTX PRO 6000 Blackwell** 上，使用 **Qwen3.5-35B-A3B BF16** 和 **vLLM 0.20.0**。
+
+**真实单层 decode 回放**使用相同的专家 ID、路由权重和模型层输入。CUDA Event 计时独立算子的 CUDA Graph 重放，单位为 µs。
+
+| 每批 token 数 | vLLM Triton | MoE Kernel | 专家计算耗时变化 |
+| ---: | ---: | ---: | ---: |
+| 1 | 22.99 | 15.03 | **−34.6%** |
+| 4 | 55.48 | 23.71 | **−57.3%** |
+| 8 | 99.01 | 25.13 | **−74.6%** |
+
+回放覆盖第 0、20、39 层的 13 个样本。1,740 个 token 的 Top-K 专家集合全部匹配原生实现，routed 输出最大绝对误差为 0.0078125。实测的三个 prefill 批次（130、520、1040 token）在专家计算上与原生接近。
+
+**整模型服务压测**使用 eager 模式、128 输入 token、16 输出 token、并发 8。共 3 轮、9 组、288 个计量请求，下表为相对同轮 `native` 的变化中位数。
+
+| 模式 | 输出吞吐 | P95 首 token 延迟 |
+| --- | ---: | ---: |
+| `experts` | +2.33% | +11.23% |
+| `full` | +0.70% | +5.01% |
+
+该负载下，专家算子回放的收益只部分反映在服务吞吐上，P95 首 token 延迟上升。复现命令、对照边界和指标口径见 [评测指南](benchmarks/README.md)。
 
 ## 快速开始
 
-准备 Python 3.10 或更高版本、支持 CUDA 的 PyTorch 2.8 或更高版本，以及与该环境兼容的 Triton。在仓库根目录安装项目。
+在具备 NVIDIA CUDA GPU 的环境中准备 Python 3.10+、PyTorch 2.8+、与 PyTorch/CUDA 匹配的 Triton，以及 setuptools 68+。
 
 ```bash
+git clone https://github.com/SunnyFish333/moe-kernel.git
+cd moe-kernel
 python -m pip install --no-deps --no-build-isolation .
 ```
 
-以下示例使用随机权重和输入，可独立运行。
+下面用随机权重运行一次 routed MoE，适合先验证本地 CUDA 环境。
 
 ```python
 import torch
@@ -23,8 +53,7 @@ import torch
 from moe_kernel import MoEConfig, MoEWorkspace, moe
 
 m, h, i, e, r = 8, 64, 32, 16, 4
-device = torch.device("cuda")
-dtype = torch.bfloat16
+device, dtype = torch.device("cuda"), torch.bfloat16
 config = MoEConfig(hidden_dim=h, intermediate_dim=i, num_experts=e, top_k=r)
 
 with torch.inference_mode():
@@ -35,57 +64,68 @@ with torch.inference_mode():
 
     workspace = MoEWorkspace()
     workspace.prepare(max_tokens=m, config=config, device=device, dtype=dtype)
-    y = moe(x, logits, w13, w2, top_k=r,
-            renormalize=config.renormalize, workspace=workspace)
+
+    y = moe(x, logits, w13, w2, top_k=r, workspace=workspace)
     print(y.shape)  # torch.Size([8, 64])
 ```
 
-| 参数或结果 | 形状 | 类型与含义 |
-| --- | --- | --- |
-| `x` | `[M, H]` | BF16 或 FP16 激活 |
-| `logits` | `[M, E]` | 有限的 BF16 或 FP32 router logits |
-| `w13` | `[E, 2I, H]` | 与激活同类型，前一半为 gate，后一半为 up |
-| `w2` | `[E, H, I]` | 与激活同类型的 down projection |
-| `topk_weights`、`topk_ids` | `[M, R]` | FP32 权重，INT32 或 INT64 专家 ID，ID 范围为 `[0, E)` |
-| 输出或可选的 `out` | `[M, H]` | 与激活同类型 |
+- **从 logits 开始**　`moe(x, logits, w13, w2, top_k=R, workspace=workspace)` 执行 Top-K 和专家前向。logits 支持 BF16 或 FP32。
+- **已有路由**　`experts(x, w13, w2, topk_weights, topk_ids, workspace=workspace)` 直接计算专家输出。路由权重为 FP32，专家 ID 为 INT32 或 INT64。
+- **复用缓冲区**　两个接口都返回 `[M, H]`，可传入独立的 `out`。输入与权重必须连续、处于同一 CUDA 设备，并使用相同的激活与权重 dtype。workspace 可在同一 CUDA stream 上顺序复用。
 
-`M` 是实际批次 token 数，`H` 是隐藏维度，`I` 是单个专家的中间维度，`E` 是专家数，`R` 是每个 token 选择的专家数。张量须在同一 CUDA 设备且连续。已有路由时使用 `experts(x, w13, w2, topk_weights, topk_ids, workspace=workspace)`。两个入口都可提供独立的 `out` 缓冲区。
-
-workspace 按最大 token 数、模型形状和 dtype 预分配，可在同一 CUDA stream 上顺序复用。多 stream 并行时使用独立 workspace 或同步访问。独立算子可预热并在 CUDA Graph 中捕获和重放，重放时保持形状及缓冲区地址，路由值可以变化。
-
-## 实现
-
-```text
-Router logits → Softmax Top-K → 路由索引分组与对齐
-                                      ↓
-输入激活 ──────────────────────────→ GEMM1 → SwiGLU → GEMM2 并加权 → 沿 Top-K 求和
-```
-
-- Top-K 在同一 kernel 中将 logits 转为 FP32 计算并返回 FP32 路由权重。开启 `renormalize` 时，权重在所选专家内归一化。
-- 按专家整理路由索引，并对齐到 GEMM 行块。GEMM1 通过路由编号读取输入激活，两次 GEMM 都按原始路由编号写回。GEMM grid 使用实际路由数及专家数计算行块上界，并由设备上的实际对齐长度限定计算范围。
-- 两次 GEMM 共用间接寻址实现，采用 FP32 累加。GEMM2 写回前应用路由权重。SwiGLU 和最终归约采用 FP32 计算，阶段输出写为激活类型。
-- 常规专家路径发射 9 次 kernel。单 token、Top-K ≤ 8 时跳过分组并直接访问专家，发射 4 次。Blackwell SM 12.0 上的 BF16 目标形状 `H=2048, I=512, E=256, R=8` 使用默认 `BM=16` workspace 时，`M=2–8` 走单次对齐，专家路径发射 5 次。该目标形状还在 `M≥96` 和 `M≥1024` 使用对应的 prefill tile。`moe()` 在专家路径上加一次 Top-K launch，空批次直接返回。
-
-### Qwen3.5-35B-A3B 架构
-
-![Qwen3.5-35B-A3B 文本解码器和 MoE 结构，256 个路由专家中每 token 选择 8 个，并使用 1 个共享专家](qwen3.5-35b-a3b-moe-architecture.svg)
-
-示意图依据 [Qwen 官方模型卡](https://huggingface.co/Qwen/Qwen3.5-35B-A3B)和[模型配置](https://huggingface.co/Qwen/Qwen3.5-35B-A3B/blob/main/config.json)绘制。整模型服务评测使用该模型的 BF16 权重。
+输入激活为 `[M, H]`，logits 为 `[M, E]`，专家权重 `w13` 和 `w2` 分别为 `[E, 2I, H]`、`[E, H, I]`。`w13` 的输出通道先 gate 后 up。路由张量均为 `[M, R]`，其中 `E` 是专家数，`I` 是专家中间维度，`R` 是每个 token 选择的专家数。
 
 ## vLLM 集成
 
-插件支持单卡、未量化的 Qwen3.5 MoE，使用 eager 和 Triton 专家后端。三种模式都保留模型的 Router Linear、共享专家和最终输出合并。
+在兼容的 vLLM 0.20.0 环境内安装本项目。插件适用于单卡、未量化的 Qwen3.5 MoE。三种模式保留原生 Router Linear、共享专家、输出合并与调度。
 
-| 模式 | Top-K | 路由专家计算 |
+| `MOE_KERNEL_MODE` | Softmax Top-K | 路由专家 |
 | --- | --- | --- |
-| `native` | vLLM | vLLM |
-| `experts` | vLLM | 本项目 |
-| `full` | 本项目 | 本项目 |
+| `native`（默认） | vLLM | vLLM |
+| `experts` | vLLM | MoE Kernel |
+| `full` | MoE Kernel | MoE Kernel |
 
-查看 [插件安装、启动和支持范围](integrations/vllm/README.md)。
+```bash
+MODEL=/path/to/Qwen3.5-35B-A3B
+MOE_KERNEL_MODE=experts MOE_KERNEL_MAX_TOKENS=2048 \
+  vllm serve "$MODEL" --host 127.0.0.1 --port 8000 \
+    --tensor-parallel-size 1 --language-model-only \
+    --enforce-eager --moe-backend triton --dtype bfloat16 \
+    --max-model-len 8192 --max-num-seqs 8 --max-num-batched-tokens 2048
+```
 
-## 测试与评测
+`MOE_KERNEL_MAX_TOKENS` 须覆盖调度器的批次 token 预算。切换模式要重启服务。环境要求、支持范围和短请求验证见 [vLLM 插件指南](integrations/vllm/README.md)。
 
-PyTorch 对照按 expert 批量计算，用于验证路由、专家计算和完整 MoE 前向。有测试文件的工作副本可安装 pytest，再通过 `python -m pytest` 运行测试，或用 `python -B tests/run_validation.py --target-shape` 生成本地测试报告。
+## 实现
 
-评测包含合成输入微基准、真实模型层采集与回放、整模型服务压测。运行命令、基线边界和指标口径见 [评测指南](benchmarks/README.md)。
+<p align="center">
+  <img src="qwen3.5-35b-a3b-moe-architecture.svg" alt="Qwen3.5-35B-A3B 文本解码器与 MoE，256 个路由专家中每 token 选择 8 个，同时经过 1 个共享专家" width="900">
+</p>
+
+图依据 [Qwen 官方模型卡](https://huggingface.co/Qwen/Qwen3.5-35B-A3B)和[模型配置](https://huggingface.co/Qwen/Qwen3.5-35B-A3B/blob/main/config.json)绘制。
+
+| 组件 | 实现 |
+| --- | --- |
+| [Top-K](moe_kernel/router.py) | 在一次 launch 内将 logits 转为 FP32、选择专家、计算路由权重 |
+| [路由对齐](moe_kernel/align.py) | 按专家重排路由索引并补齐到 GEMM 行块，保留原始 hidden states 布局 |
+| [Grouped GEMM](moe_kernel/gemm.py) | 间接寻址读取输入，FP32 累加。第二次 GEMM 写回前乘路由权重 |
+| [SwiGLU](moe_kernel/activation.py) 与[输出归约](moe_kernel/reduce.py) | 逐路由激活，再沿 Top-K 维归约到原 token 顺序 |
+| [派发](moe_kernel/api.py)与 [workspace](moe_kernel/workspace.py) | 按批次形状选路径，复用索引与中间缓冲区 |
+
+常规专家路径发射 9 次 kernel。单 token 且 Top-K ≤ 8 时直接寻址专家，发射 4 次。目标 BF16 形状在 Blackwell SM 12.0、默认 BM=16 时，2–8 个 token 用[单次对齐](moe_kernel/align_short.py)，专家路径共发射 5 次。独立算子支持 CUDA Graph 重放，vLLM 插件使用 eager 模式。
+
+## 复现评测
+
+| 层级 | 入口 | 适合回答的问题 |
+| --- | --- | --- |
+| 合成微基准 | [`bench_moe`](benchmarks/bench_moe.py) | 不同 token 数和路由分布下的 CUDA Event 延迟 |
+| 真实单层回放 | [`capture_layer`](benchmarks/capture_layer.py) · [`replay_layer`](benchmarks/replay_layer.py) | 固定真实输入时，路由和专家输出是否一致 |
+| 整模型服务 | [`bench_serve`](benchmarks/bench_serve.py) | 替换算子对吞吐和延迟的影响 |
+
+已有 CUDA 环境时可先运行独立专家微基准。对照原生 vLLM 时将 `--backend custom` 换为 `--backend both`。
+
+```bash
+python -m benchmarks.bench_moe --backend custom --boundary experts --tokens 1 8 128
+```
+
+模型采集、回放和服务压测的完整命令见 [评测指南](benchmarks/README.md)。逐阶段的数值语义见 [PyTorch reference](moe_kernel/reference.py)。
